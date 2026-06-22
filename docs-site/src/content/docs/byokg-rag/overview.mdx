@@ -18,6 +18,8 @@ The graphrag-toolkit [byokg-rag](https://github.com/awslabs/graphrag-toolkit/blo
 
 The byokg-rag library depends on two backend systems: a _graph store_ and a _foundation model provider_. The graph store manages the knowledge graph data structure and provides interfaces for graph traversal and querying. The foundation model provider hosts the Large Language Models (LLMs) used for question understanding, entity linking, and answer generation.
 
+BYOKG-RAG can also be used with RDF/SPARQL graph stores. The RDFox contributor package provides `RDFoxSPARQLGraphStore` for native RDF traversal and `SPARQLKGLinker` for SPARQL query generation.
+
 The library supports Amazon Neptune graph databases that provide schema information and query execution capabilities. The recommended LLM provider is Amazon Bedrock with Claude Sonnet, configured explicitly via `BedrockGenerator`. The library can also be extended to support other LLM providers.
 
 ### Multi-strategy retrieval

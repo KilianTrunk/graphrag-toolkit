@@ -1,0 +1,61 @@
+---
+title: RDFox Graph Store
+---
+
+### Topics
+
+- [Overview](#overview)
+- [Install package](#install-package)
+- [Registering RDFox as a graph store](#registering-rdfox-as-a-graph-store)
+- [Creating an RDFox graph store](#creating-an-rdfox-graph-store)
+- [Compatibility](#compatibility)
+
+### Overview
+
+You can use [RDFox](https://www.oxfordsemantic.tech/rdfox) as a graph store through the `graphrag-toolkit-rdfox` contributor package.
+
+RDFox is an RDF/SPARQL database, while the lexical graph writes and reads a property-graph model. The RDFox adapter maps lexical graph nodes, relationships, labels, and properties to RDF triples and translates the GraphRAG Toolkit generated Cypher subset to SPARQL.
+
+### Install package
+
+```sh
+pip install "graphrag-toolkit-rdfox @ git+https://github.com/awslabs/graphrag-toolkit.git#subdirectory=lexical-graph-contrib/rdfox"
+```
+
+### Registering RDFox as a graph store
+
+Before creating an RDFox graph store, register `RDFoxGraphStoreFactory` with `GraphStoreFactory`:
+
+```python
+from graphrag_toolkit.lexical_graph.storage import GraphStoreFactory
+from graphrag_toolkit_contrib.lexical_graph.storage.graph.rdfox import RDFoxGraphStoreFactory
+
+GraphStoreFactory.register(RDFoxGraphStoreFactory)
+```
+
+### Creating an RDFox graph store
+
+Use `GraphStoreFactory.for_graph_store()` with an RDFox connection string:
+
+```python
+from graphrag_toolkit.lexical_graph.storage import GraphStoreFactory
+from graphrag_toolkit_contrib.lexical_graph.storage.graph.rdfox import RDFoxGraphStoreFactory
+
+GraphStoreFactory.register(RDFoxGraphStoreFactory)
+
+with GraphStoreFactory.for_graph_store(
+    "rdfox://localhost:12110/graphrag",
+    username="<username>",
+    password="<password>",
+    base_iri="https://example.com/graphrag/",
+) as graph_store:
+    ...
+```
+
+Use `rdfox://host:port/datastore` for HTTP and `rdfox+https://host:port/datastore` for HTTPS. You can also pass `endpoint_url`, `datastore`, `username`, `password`, `bearer_token`, `verify`, `timeout`, and `base_iri` as keyword arguments.
+
+### Compatibility
+
+The RDFox lexical graph store supports GraphRAG Toolkit generated Cypher used for lexical graph ingest, versioned updates, deletion, and traversal-based search. It does not execute arbitrary Cypher.
+
+For existing RDF knowledge graphs, use RDFox with [BYOKG-RAG](/graphrag-toolkit/byokg-rag/overview/) and the `RDFoxSPARQLGraphStore` instead. BYOKG-RAG uses SPARQL directly and does not require the lexical graph RDF mapping.
