@@ -22,6 +22,7 @@ class ByoKGQueryEngine:
                  llm_generator=None,
                  kg_linker=None,
                  cypher_kg_linker=None,
+                 sparql_kg_linker=None,
                  direct_query_linking=False):
         """
         Initialize the query engine.
@@ -35,6 +36,7 @@ class ByoKGQueryEngine:
             llm_generator: Optional language model for generating responses
             kg_linker: Optional KG linker for multi-strategy retrieval
             cypher_kg_linker: Optional Cypher KG linker for cypher-based retrieval
+            sparql_kg_linker: Optional SPARQL KG linker for RDF graph query retrieval
             direct_query_linking: Flag whether to use entity linker with query embedding directly
         """
         self.graph_store = graph_store
@@ -98,6 +100,14 @@ class ByoKGQueryEngine:
             self.cypher_kg_linker_prompts = self.cypher_kg_linker.task_prompts
             self.cypher_kg_linker_prompts_iterative = self.cypher_kg_linker.task_prompts_iterative
 
+        if sparql_kg_linker is not None:
+            assert hasattr(sparql_kg_linker, "is_sparql_linker"), "sparql_kg_linker must be an instance of SPARQLKGLinker"
+        self.sparql_kg_linker = sparql_kg_linker
+
+        if self.sparql_kg_linker is not None:
+            self.sparql_kg_linker_prompts = self.sparql_kg_linker.task_prompts
+            self.sparql_kg_linker_prompts_iterative = self.sparql_kg_linker.task_prompts_iterative
+
     def _add_to_context(self, context_list: List[str], new_items: List[str]) -> None:
         """
         Add new items to context list while maintaining order and avoiding duplicates.
@@ -116,7 +126,14 @@ class ByoKGQueryEngine:
                 seen.add(item)
 
     
-    def query(self, query: str, iterations: int = 2, cypher_iterations: int = 2, user_input: str = "") -> List[str]:
+    def query(
+        self,
+        query: str,
+        iterations: int = 2,
+        cypher_iterations: int = 2,
+        sparql_iterations: int | None = None,
+        user_input: str = "",
+    ) -> List[str]:
         """
         Process a query through the retrieval and generation pipeline.
 
@@ -124,6 +141,7 @@ class ByoKGQueryEngine:
             query: The search query
             iterations: Number of retrieval iterations to perform
             cypher_iterations: Number of cypher generation retries
+            sparql_iterations: Number of SPARQL generation retries. Defaults to cypher_iterations.
             user_input: Optional user input for additional instructions or context
 
         Returns:
@@ -133,6 +151,7 @@ class ByoKGQueryEngine:
         explored_entities: Set[str] = set()
         opencypher_answers: List[str] = []
         cypher_context_with_feedback: List[str] = []
+        sparql_context_with_feedback: List[str] = []
 
         if self.direct_query_linking:
             semantic_linked_entities = self.entity_linker.link([query], return_dict=False)
@@ -192,6 +211,54 @@ class ByoKGQueryEngine:
             if self.kg_linker is None:
                 return cypher_context_with_feedback
             # TODO : Combine cypher linker with KG linker dynamically
+
+        if self.sparql_kg_linker is not None:
+
+            assert self.graph_query_executor is not None, "graph_query_executor must be initialized"
+
+            for iteration in range(sparql_iterations if sparql_iterations is not None else cypher_iterations):
+                if iteration == 0:
+                    task_prompts = self.sparql_kg_linker.task_prompts
+                else:
+                    task_prompts = self.sparql_kg_linker.task_prompts_iterative
+
+                response = self.sparql_kg_linker.generate_response(
+                    question=query,
+                    schema=self.schema,
+                    graph_context="\n".join(sparql_context_with_feedback) if sparql_context_with_feedback else "",
+                    task_prompts=task_prompts,
+                    user_input=user_input
+                )
+                artifacts = self.sparql_kg_linker.parse_response(response)
+
+                task_completion = parse_response(response, r"<task-completion>(.*?)</task-completion>")
+                if "FINISH" in " ".join(task_completion):
+                    break
+
+                if "sparql-linking" in artifacts:
+                    linking_query = " ".join(artifacts["sparql-linking"])
+                    context, linked_entities_sparql = self.graph_query_executor.retrieve(linking_query, return_answers=True)
+                    sparql_context_with_feedback += context
+                    if len(linked_entities_sparql) == 0:
+                        has_error = any("Error" in c and "Error executing query" in c for c in context)
+                        if has_error:
+                            sparql_context_with_feedback.append("The above SPARQL query for entity linking failed with an error. Please review the error message and fix the query syntax or schema references.")
+                        else:
+                            sparql_context_with_feedback.append("No executable results for the above SPARQL query for entity linking. Please improve SPARQL generation in the future for linking.")
+
+                if "sparql" in artifacts:
+                    graph_query = " ".join(artifacts["sparql"])
+                    context, answers = self.graph_query_executor.retrieve(graph_query, return_answers=True)
+                    sparql_context_with_feedback += context
+                    if len(answers) == 0:
+                        has_error = any("Error" in c and "Error executing query" in c for c in context)
+                        if has_error:
+                            sparql_context_with_feedback.append("The above SPARQL query failed with an error. Please review the error message and fix the query syntax or schema references.")
+                        else:
+                            sparql_context_with_feedback.append("No executable results for the above. Please improve SPARQL generation in the future by focusing more on the given schema and RDF predicates.")
+
+            if self.kg_linker is None:
+                return cypher_context_with_feedback + sparql_context_with_feedback
         
 
         # If kg_linker is provided, ByoKGQueryEngine tries to solve KGQA with multi-strategy retrieval
@@ -239,7 +306,7 @@ class ByoKGQueryEngine:
                 self._add_to_context(retrieved_context, path_context)
 
             # Process graph queries
-            for query_type in ["opencypher", "opencypher-neptune-rdf", "opencypher-neptune"]:
+            for query_type in ["opencypher", "opencypher-neptune-rdf", "opencypher-neptune", "sparql"]:
                 if query_type in artifacts and self.graph_query_executor:
                     graph_query = " ".join(artifacts[query_type])
                     context = self.graph_query_executor.retrieve(graph_query, return_answers=False)
@@ -248,7 +315,7 @@ class ByoKGQueryEngine:
             task_completion = parse_response(response, r"<task-completion>(.*?)</task-completion>")
             if "FINISH" in " ".join(task_completion):
                 break
-        return cypher_context_with_feedback + retrieved_context
+        return cypher_context_with_feedback + sparql_context_with_feedback + retrieved_context
 
     def generate_response(self, query: str, graph_context: str = "", task_prompt = None, user_input: str = "") -> Tuple[List[str], str]:
         """

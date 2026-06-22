@@ -186,3 +186,42 @@ class CypherKGLinker(KGLinker):
         tasks =  graph_store.get_linker_tasks()
         assert "opencypher" in tasks, "Graphstore needs to support openCypher execution for CypherKGLinker"
         return ["opencypher-linking", "opencypher", "draft-answer-generation"]
+
+
+class SPARQLKGLinker(KGLinker):
+    """
+    Linker for graph stores that expose SPARQL query execution.
+    """
+    def __init__(self,
+            llm_generator=None,
+            graph_store=None,
+            max_input_tokens: int = 32000
+            ):
+        super().__init__(llm_generator, graph_store, max_input_tokens)
+
+        self.AVAILABLE_TASKS = {
+            "entity-extraction": {"pattern": r"<entities>(.*?)</entities>"},
+            "path-extraction": {"pattern": r"<paths>(.*?)</paths>"},
+            "sparql": {"pattern": r"<sparql>(.*?)</sparql>"},
+            "sparql-linking": {"pattern": r"<sparql-linking>(.*?)</sparql-linking>"},
+            "draft-answer-generation": {"pattern": r"<answers>(.*?)</answers>"},
+        }
+
+    def _finalize_prompt_iterative_prompt(self):
+        task_prompts = ""
+        for task in self.tasks:
+            if task == "sparql-linking":
+                task_prompt = load_yaml(self.task_prompt_file)["sparql-linking-iterative"]
+            else:
+                task_prompt = load_yaml(self.task_prompt_file)[task]
+            task_prompts += f"\n\n{task_prompt}\n\n"
+
+        return task_prompts
+
+    def is_sparql_linker(self):
+        return True
+
+    def get_tasks(self, graph_store):
+        tasks = graph_store.get_linker_tasks()
+        assert "sparql" in tasks, "Graphstore needs to support SPARQL execution for SPARQLKGLinker"
+        return ["sparql-linking", "sparql", "draft-answer-generation"]

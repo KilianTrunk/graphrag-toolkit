@@ -570,6 +570,14 @@ class TestGraphQueryRetrieverIsQuerySafe:
         
         assert retriever.is_query_safe("MATCH (n) RETURN n") is True
         assert retriever.is_query_safe("SELECT * FROM nodes") is True
+        assert retriever.is_query_safe("PREFIX ex: <https://example.com/>\nASK { ?s ?p ?o }") is True
+        assert retriever.is_query_safe("CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }") is True
+
+    def test_is_query_safe_sparql_describe_query(self, mock_graph_store):
+        """Verify DESCRIBE queries are outside the supported read-only SPARQL subset."""
+        retriever = GraphQueryRetriever(graph_store=mock_graph_store)
+
+        assert retriever.is_query_safe("DESCRIBE <https://example.com/resource>") is False
     
     def test_is_query_safe_create_query(self, mock_graph_store):
         """Verify CREATE queries are blocked."""

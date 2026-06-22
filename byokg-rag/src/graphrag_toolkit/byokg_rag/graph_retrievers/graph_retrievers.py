@@ -385,6 +385,9 @@ class GraphQueryRetriever(GRetriever):
         """
         if not self.block_graph_modification:
             return True
+
+        if self._looks_like_sparql(graph_query):
+            return self._is_sparql_query_safe(graph_query)
         
         # Keywords that indicate graph modification operations
         modification_keywords = [
@@ -410,6 +413,32 @@ class GraphQueryRetriever(GRetriever):
             if re.search(pattern, query_upper, re.MULTILINE):
                 return False
         
+        return True
+
+    def _looks_like_sparql(self, graph_query: str) -> bool:
+        query = re.sub(r'#.*', '', graph_query)
+        query = unicodedata.normalize('NFKC', query).strip().upper()
+        query = re.sub(r'^(PREFIX|BASE)\b[^\n]*\n', '', query, flags=re.MULTILINE).strip()
+        return query.startswith(("SELECT", "ASK", "CONSTRUCT", "DESCRIBE", "INSERT", "DELETE", "LOAD", "CLEAR", "CREATE", "DROP", "COPY", "MOVE", "ADD", "WITH"))
+
+    def _is_sparql_query_safe(self, graph_query: str) -> bool:
+        query = re.sub(r'/\*.*?\*/', '', graph_query, flags=re.DOTALL)
+        query = re.sub(r'#.*', '', query)
+        query = unicodedata.normalize('NFKC', query).strip().upper()
+        query = re.sub(r'^(PREFIX|BASE)\b[^\n]*\n', '', query, flags=re.MULTILINE).strip()
+
+        if not query.startswith(("SELECT", "ASK", "CONSTRUCT")):
+            return False
+
+        modification_keywords = [
+            "INSERT", "DELETE", "LOAD", "CLEAR", "CREATE", "DROP",
+            "COPY", "MOVE", "ADD", "WITH", "USING", "GRAPH STORE",
+        ]
+        for keyword in modification_keywords:
+            pattern = r'\b' + re.escape(keyword) + r'\b'
+            if re.search(pattern, query, re.MULTILINE):
+                return False
+
         return True
 
     def retrieve(self, graph_query: str, return_answers=False, **kwargs):
@@ -460,4 +489,3 @@ class GraphQueryRetriever(GRetriever):
                 return [error_msg], []
             else:
                 return [error_msg]
-

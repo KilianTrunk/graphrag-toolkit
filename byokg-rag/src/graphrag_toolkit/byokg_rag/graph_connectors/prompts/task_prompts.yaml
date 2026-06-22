@@ -182,3 +182,73 @@ opencypher-linking-iterative: '''
     LIMIT 5
 
     '''
+
+sparql: '''
+    ### Task: SPARQL Query Generation
+    Construct a complete, executable SPARQL query that retrieves the answer from an RDF graph.
+    - Your query must only use classes, predicates, and graph terms defined in the provided schema.
+    - Generate read-only SPARQL only: SELECT, ASK, or CONSTRUCT.
+    - Include PREFIX declarations only when needed.
+    - Use FILTER, aggregation, ordering, and LIMIT where required by the question.
+    - If graph context is provided, incorporate the relevant entities and predicates identified from the context.
+
+    - Format your response as follows:
+
+    <sparql>
+    SELECT ...
+    WHERE {
+      ...
+    }
+    </sparql>
+
+    '''
+
+sparql-linking: '''
+    ## Task: SPARQL Keyword and Entity Linking
+    Extract all relevant entities and keywords from the question that need to be linked to the RDF graph.
+    Construct a complete, executable read-only SPARQL query for checking whether those entities or keywords match graph resources.
+    - Your query must only use classes and predicates defined in the provided schema.
+    - Prefer case-insensitive contains filters on labels or text predicates when the schema exposes them.
+    - Return the linked resource URI or identifier.
+    - Limit the return results to 5 at this step.
+
+    - Format your response as follows:
+
+    <sparql-linking>
+    SELECT ?entity
+    WHERE {
+      ...
+    }
+    LIMIT 5
+    </sparql-linking>
+
+    '''
+
+sparql-linking-iterative: '''
+    ## Task: Iterative SPARQL Keyword and Entity Linking & Task Completion
+    Based on the current graph context and question, identify remaining entities and keywords that need to be linked to continue answering the question.
+    Construct a complete, executable read-only SPARQL query for checking whether those entities or keywords match graph resources.
+    - Your query must only use classes and predicates defined in the provided schema.
+    - Prefer case-insensitive contains filters on labels or text predicates when the schema exposes them.
+    - If execution feedback is provided, avoid the same syntax or schema errors.
+    - Limit the return results to 5 at this step.
+    - Return the linked resource URI or identifier.
+
+    - Format your response as follows:
+
+    <sparql-linking>
+    SELECT ?entity
+    WHERE {
+      ...
+    }
+    LIMIT 5
+    </sparql-linking>
+
+    Task Completion Instructions:
+    If the current graph context provides sufficient information to answer the question and no further entity linking is needed, respond with:
+    <task-completion>
+    FINISH
+    </task-completion>
+    If the linking task is not completed and more entities need to be explored, do not include <task-completion> tags.
+
+    '''
