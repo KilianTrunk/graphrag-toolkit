@@ -53,7 +53,7 @@ def test_unwind_merge_node_write_emits_typed_node_and_properties():
     assert "hello" in update
 
 
-def test_unwind_merge_relationship_write_emits_edge_resource():
+def test_unwind_merge_relationship_without_properties_emits_direct_predicate():
     store = RDFoxGraphStore(endpoint_url="http://localhost:12110", datastore="graphrag")
     client = _Client()
     store._client = client
@@ -69,10 +69,33 @@ def test_unwind_merge_relationship_write_emits_edge_resource():
     )
 
     update = client.updates[0]
+    assert "rel/extracted_from" in update
+    assert "pg/Edge" not in update
+    assert "pg/from" not in update
+    assert "pg/to" not in update
+
+
+def test_unwind_merge_relationship_with_properties_emits_edge_resource():
+    store = RDFoxGraphStore(endpoint_url="http://localhost:12110", datastore="graphrag")
+    client = _Client()
+    store._client = client
+
+    store.execute_query_with_retry(
+        """// insert fact-statement relationships
+        UNWIND $params AS params
+        MERGE (fact:`__Fact__`{factId: params.fact_id})
+        MERGE (statement:`__Statement__`{statementId: params.statement_id})
+        MERGE (fact)-[:`__SUPPORTS__`{value: params.score}]->(statement)
+        """,
+        {"params": [{"fact_id": "f1", "statement_id": "s1", "score": 1}]},
+    )
+
+    update = client.updates[0]
     assert "pg/Edge" in update
     assert "pg/from" in update
     assert "pg/to" in update
-    assert "edgeType/__EXTRACTED_FROM__" in update
+    assert "edgeType/__SUPPORTS__" in update
+    assert "prop/value" in update
 
 
 def test_delete_source_topic_lookup_uses_rdf_edge_path():
@@ -91,6 +114,8 @@ def test_delete_source_topic_lookup_uses_rdf_edge_path():
     )
 
     assert rows == [{"topicId": "topic-1"}]
+    assert "rel/mentioned_in" in client.queries[0]
+    assert "rel/extracted_from" in client.queries[0]
     assert "edgeType/__MENTIONED_IN__" in client.queries[0]
     assert "edgeType/__EXTRACTED_FROM__" in client.queries[0]
 
@@ -112,4 +137,5 @@ def test_delete_source_fact_lookup_uses_statement_targets():
 
     assert rows == [{"factId": "fact-1"}]
     assert "VALUES ?targetId" in client.queries[0]
+    assert "rel/supports" in client.queries[0]
     assert "edgeType/__SUPPORTS__" in client.queries[0]

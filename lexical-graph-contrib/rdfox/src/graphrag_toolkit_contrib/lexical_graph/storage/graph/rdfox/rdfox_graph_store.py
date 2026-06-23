@@ -175,9 +175,9 @@ class RDFoxGraphStore(GraphStore):
                     raise UnsupportedRDFoxQueryError(f"Relationship endpoints were not MERGEd in query: {cypher}")
 
                 rel_type = match.group("type")
-                rel_value = self._relationship_value(match.group("props"), param, parameters)
-                edge_iri = self.terms.edge_iri(src["iri"], rel_type, dst["iri"], rel_value)
-                updates.extend(self._edge_insert_triples(edge_iri, src["iri"], rel_type, dst["iri"], rel_value))
+                rel_props = match.group("props")
+                rel_value = self._relationship_value(rel_props, param, parameters)
+                updates.extend(self._relationship_insert_triples(src["iri"], rel_type, dst["iri"], rel_value, rel_props))
 
             if updates:
                 self.client.update(f"INSERT DATA {{\n{chr(10).join(updates)}\n}}")
@@ -219,9 +219,11 @@ class RDFoxGraphStore(GraphStore):
             self.client.update(
                 "DELETE {\n"
                 f"  {self.terms.iri(node_iri)} ?p ?o .\n"
+                f"  ?incoming ?incomingP {self.terms.iri(node_iri)} .\n"
                 "  ?edge ?edgeP ?edgeO .\n"
                 "}\nWHERE {\n"
                 f"  OPTIONAL {{ {self.terms.iri(node_iri)} ?p ?o . }}\n"
+                f"  OPTIONAL {{ ?incoming ?incomingP {self.terms.iri(node_iri)} . }}\n"
                 f"  OPTIONAL {{ ?edge <{self.terms.pg}from>|<{self.terms.pg}to> {self.terms.iri(node_iri)} . ?edge ?edgeP ?edgeO . }}\n"
                 "}"
             )
@@ -331,8 +333,8 @@ class RDFoxGraphStore(GraphStore):
             f"  ?entity a <{self.terms.label_iri('__Entity__')}> .\n"
             f"  {' '.join(filters)}\n"
             f"  ?entity <{self.terms.predicate_iri('entityId')}> ?entityId .\n"
-            f"  ?edge <{self.terms.pg}from> ?entity ; <{self.terms.pg}edgeType> ?edgeType .\n"
-            f"  FILTER(?edgeType IN (<{self.terms.edge_type_iri('__SUBJECT__')}>, <{self.terms.edge_type_iri('__OBJECT__')}>))\n"
+            + self._edge_match_pattern("?entity", ["__SUBJECT__", "__OBJECT__"], "?target", "?edge")
+            + "\n"
             "} GROUP BY ?entityId ORDER BY DESC(?score) "
             f"LIMIT {int(limit)}"
         )
@@ -345,7 +347,8 @@ class RDFoxGraphStore(GraphStore):
             statement_iri = self.terms.node_iri("__Statement__", statement_id)
             facts = self.client.query(
                 "SELECT DISTINCT ?fact WHERE {\n"
-                f"  ?edge <{self.terms.pg}to> {self.terms.iri(statement_iri)} ; <{self.terms.pg}edgeType> <{self.terms.edge_type_iri('__SUPPORTS__')}> ; <{self.terms.pg}from> ?factNode .\n"
+                + self._edge_match_pattern("?factNode", ["__SUPPORTS__"], self.terms.iri(statement_iri), "?edge")
+                + "\n"
                 f"  ?factNode <{self.terms.predicate_iri('value')}> ?fact .\n"
                 "}"
             )
@@ -420,11 +423,14 @@ class RDFoxGraphStore(GraphStore):
             "SELECT ?statement ?details ?topic ?topicId ?chunkId ?sourceId ?sourceProp ?sourceValue WHERE {\n"
             f"  {self.terms.iri(statement)} <{self.terms.predicate_iri('statementId')}> ?statementId ; <{self.terms.predicate_iri('value')}> ?statement .\n"
             f"  OPTIONAL {{ {self.terms.iri(statement)} <{self.terms.predicate_iri('details')}> ?details . }}\n"
-            f"  ?e1 <{self.terms.pg}from> {self.terms.iri(statement)} ; <{self.terms.pg}edgeType> <{self.terms.edge_type_iri('__BELONGS_TO__')}> ; <{self.terms.pg}to> ?topicNode .\n"
+            + self._edge_match_pattern(self.terms.iri(statement), ["__BELONGS_TO__"], "?topicNode", "?e1")
+            + "\n"
             f"  ?topicNode <{self.terms.predicate_iri('topicId')}> ?topicId ; <{self.terms.predicate_iri('value')}> ?topic .\n"
-            f"  ?e2 <{self.terms.pg}from> {self.terms.iri(statement)} ; <{self.terms.pg}edgeType> <{self.terms.edge_type_iri('__MENTIONED_IN__')}> ; <{self.terms.pg}to> ?chunkNode .\n"
+            + self._edge_match_pattern(self.terms.iri(statement), ["__MENTIONED_IN__"], "?chunkNode", "?e2")
+            + "\n"
             f"  ?chunkNode <{self.terms.predicate_iri('chunkId')}> ?chunkId .\n"
-            f"  ?e3 <{self.terms.pg}from> ?chunkNode ; <{self.terms.pg}edgeType> <{self.terms.edge_type_iri('__EXTRACTED_FROM__')}> ; <{self.terms.pg}to> ?sourceNode .\n"
+            + self._edge_match_pattern("?chunkNode", ["__EXTRACTED_FROM__"], "?sourceNode", "?e3")
+            + "\n"
             f"  ?sourceNode <{self.terms.predicate_iri('sourceId')}> ?sourceId .\n"
             f"  OPTIONAL {{ ?sourceNode ?sourceProp ?sourceValue . FILTER(STRSTARTS(STR(?sourceProp), \"{self.terms.prop_ns}\")) }}\n"
             "}"
@@ -456,7 +462,7 @@ class RDFoxGraphStore(GraphStore):
     def _nodes_reaching_source(self, label: str, id_key: str, source_iri: str, rel_path: list[str]) -> list[str]:
         nodes = ["?node"] + [f"?mid{i}" for i in range(1, len(rel_path))] + [self.terms.iri(source_iri)]
         edge_patterns = [
-            f"  ?edge{i} <{self.terms.pg}from> {nodes[i]} ; <{self.terms.pg}edgeType> <{self.terms.edge_type_iri(rel_type)}> ; <{self.terms.pg}to> {nodes[i + 1]} ."
+            self._edge_match_pattern(nodes[i], [rel_type], nodes[i + 1], f"?edge{i}")
             for i, rel_type in enumerate(rel_path)
         ]
         sparql = (
@@ -480,27 +486,25 @@ class RDFoxGraphStore(GraphStore):
             return []
 
         values = " ".join(self.terms.literal(target_id) for target_id in target_ids)
-        rel_filter = ", ".join(f"<{self.terms.edge_type_iri(rel_type)}>" for rel_type in rel_types)
         rows = self.client.query(
             "SELECT DISTINCT ?id WHERE {\n"
             f"  VALUES ?targetId {{ {values} }}\n"
             f"  ?target a <{self.terms.label_iri(target_label)}> ; <{self.terms.predicate_iri(target_id_key)}> ?targetId .\n"
             f"  ?node a <{self.terms.label_iri(label)}> ; <{self.terms.predicate_iri(id_key)}> ?id .\n"
-            f"  ?edge <{self.terms.pg}from> ?node ; <{self.terms.pg}edgeType> ?edgeType ; <{self.terms.pg}to> ?target .\n"
-            f"  FILTER(?edgeType IN ({rel_filter}))\n"
+            + self._edge_match_pattern("?node", rel_types, "?target", "?edge")
+            + "\n"
             "}"
         )
         return [row["id"] for row in rows]
 
     def _orphaned_nodes(self, label: str, id_key: str, node_ids: list[str], rel_types: list[str]) -> list[str]:
         orphaned = []
-        rel_filter = ", ".join(f"<{self.terms.edge_type_iri(rel_type)}>" for rel_type in rel_types)
         for node_id in node_ids:
             node_iri = self.terms.node_iri(label, node_id)
             links = self.client.query(
                 "ASK {\n"
-                f"  ?edge <{self.terms.pg}from> {self.terms.iri(node_iri)} ; <{self.terms.pg}edgeType> ?edgeType .\n"
-                f"  FILTER(?edgeType IN ({rel_filter}))\n"
+                + self._edge_match_pattern(self.terms.iri(node_iri), rel_types, "?target", "?edge")
+                + "\n"
                 "}"
             )
             if not links or not links[0].get("boolean"):
@@ -513,7 +517,21 @@ class RDFoxGraphStore(GraphStore):
             self._property_triple(node_iri, id_key, node_id),
         ]
 
-    def _edge_insert_triples(self, edge_iri: str, source_iri: str, rel_type: str, target_iri: str, value: Any) -> list[str]:
+    def _relationship_insert_triples(
+        self,
+        source_iri: str,
+        rel_type: str,
+        target_iri: str,
+        value: Any,
+        rel_props: Optional[str],
+    ) -> list[str]:
+        if rel_props is None:
+            predicate = self.terms.iri(self.terms.relationship_iri(rel_type))
+            return [
+                f"{self.terms.iri(source_iri)} {predicate} {self.terms.iri(target_iri)} ."
+            ]
+
+        edge_iri = self.terms.edge_iri(source_iri, rel_type, target_iri, value)
         triples = [
             f"{self.terms.iri(edge_iri)} a <{self.terms.pg}Edge> .",
             f"{self.terms.iri(edge_iri)} <{self.terms.pg}from> {self.terms.iri(source_iri)} .",
@@ -523,6 +541,21 @@ class RDFoxGraphStore(GraphStore):
         if value is not None:
             triples.append(self._property_triple(edge_iri, "value", value))
         return triples
+
+    def _edge_match_pattern(self, source: str, rel_types: list[str], target: str, edge_var: str) -> str:
+        predicate_var = f"?{edge_var.lstrip('?')}Predicate"
+        direct_predicates = ", ".join(f"<{self.terms.relationship_iri(rel_type)}>" for rel_type in rel_types)
+        edge_types = ", ".join(f"<{self.terms.edge_type_iri(rel_type)}>" for rel_type in rel_types)
+        return (
+            f"  {{ {source} {predicate_var} {target} .\n"
+            f"    FILTER({predicate_var} IN ({direct_predicates}))\n"
+            f"    BIND({predicate_var} AS {edge_var}) }}\n"
+            "  UNION\n"
+            f"  {{ {edge_var} <{self.terms.pg}from> {source} ; "
+            f"<{self.terms.pg}edgeType> ?{edge_var.lstrip('?')}Type ; "
+            f"<{self.terms.pg}to> {target} .\n"
+            f"    FILTER(?{edge_var.lstrip('?')}Type IN ({edge_types})) }}"
+        )
 
     def _property_triple(self, subject_iri: str, key: str, value: Any) -> str:
         return f"{self.terms.iri(subject_iri)} {self.terms.iri(self.terms.predicate_iri(key))} {self.terms.literal(value)} ."

@@ -33,6 +33,8 @@ Connection strings use `rdfox://host:port/datastore` for HTTP and `rdfox+https:/
 
 The lexical graph adapter supports the GraphRAG Toolkit generated Cypher subset used by ingest, versioning, deletion, and traversal-based search. It is not a general-purpose Cypher engine.
 
+Relationships without properties are stored as direct RDF predicates, for example `rel/supports`. Relationships with properties are stored as deterministic edge resources so relationship metadata can be preserved.
+
 ## BYOKG-RAG
 
 ```python

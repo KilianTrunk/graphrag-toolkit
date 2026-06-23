@@ -16,6 +16,8 @@ You can use [RDFox](https://www.oxfordsemantic.tech/rdfox) as a graph store thro
 
 RDFox is an RDF/SPARQL database, while the lexical graph writes and reads a property-graph model. The RDFox adapter maps lexical graph nodes, relationships, labels, and properties to RDF triples and translates the GraphRAG Toolkit generated Cypher subset to SPARQL.
 
+Relationships without properties are stored as direct RDF predicates, for example `rel/supports`. Relationships with properties are stored as deterministic edge resources so relationship metadata can be preserved.
+
 ### Install package
 
 ```sh

@@ -27,6 +27,7 @@ class RDFoxTerms:
         self.node_ns = f"{self.base_iri}node/"
         self.edge_ns = f"{self.base_iri}edge/"
         self.prop_ns = f"{self.base_iri}prop/"
+        self.rel_ns = f"{self.base_iri}rel/"
         self.type_ns = f"{self.base_iri}type/"
         self.edge_type_ns = f"{self.base_iri}edgeType/"
 
@@ -49,6 +50,10 @@ class RDFoxTerms:
 
     def edge_type_iri(self, relationship_type: str) -> str:
         return f"{self.edge_type_ns}{quote(self.local(relationship_type), safe='')}"
+
+    def relationship_iri(self, relationship_type: str) -> str:
+        local_name = self.local(str(relationship_type).strip("_").lower())
+        return f"{self.rel_ns}{quote(local_name, safe='')}"
 
     def node_iri(self, label: str, node_id: Any) -> str:
         digest = sha256(f"{label}\0{node_id}".encode("utf-8")).hexdigest()
