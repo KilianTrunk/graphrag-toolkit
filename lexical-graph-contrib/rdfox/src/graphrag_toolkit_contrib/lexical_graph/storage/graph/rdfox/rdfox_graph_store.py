@@ -27,6 +27,10 @@ _SET_ASSIGNMENT = re.compile(
     r"(?P<var>[A-Za-z_][A-Za-z0-9_]*)\.(?P<key>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<expr>[^,\n]+)"
 )
 _NODE_ID_SELECTOR = re.compile(r"(?P<var>[A-Za-z_][A-Za-z0-9_]*)\.(?P<key>[A-Za-z_][A-Za-z0-9_]*)")
+_NESTED_UNWIND = re.compile(
+    r"UNWIND\s+params\.(?P<key>[A-Za-z_][A-Za-z0-9_]*)\s+as\s+(?P<alias>[A-Za-z_][A-Za-z0-9_]*)",
+    re.IGNORECASE,
+)
 
 
 class UnsupportedRDFoxQueryError(ValueError):
@@ -125,12 +129,16 @@ class RDFoxGraphStore(GraphStore):
             return []
         if upper.startswith("CREATE ") or upper.startswith("CALL DB.INDEXES"):
             return []
+        if "COPY COMPLEMENT RELATIONSHIPS" in upper:
+            return self._execute_copy_complement_relationships(parameters)
         if "UNWIND $PARAMS AS PARAMS" in upper and "MERGE " in upper:
             return self._execute_unwind_merge(normalized, parameters)
         if "DELETE SOURCE" in upper and "RETURN DISTINCT" in upper:
             return self._execute_delete_source_read(normalized, parameters)
         if upper.startswith("// SET VERSION INFO") or "\nSET " in upper:
             return self._execute_set_query(normalized, parameters)
+        if "DELETE COMPLEMENT RELATIONSHIPS" in upper:
+            return self._execute_delete_complement_relationships(parameters)
         if "DELETE " in upper or "DETACH DELETE" in upper:
             return self._execute_delete_query(normalized, parameters)
 
@@ -148,41 +156,69 @@ class RDFoxGraphStore(GraphStore):
             raise UnsupportedRDFoxQueryError(f"Unsupported RDFox lexical write query: {cypher}")
 
         for param in params:
-            nodes: dict[str, dict[str, Any]] = {}
-            updates: list[str] = []
-
-            for match in node_specs:
-                var = match.group("var")
-                label = match.group("label")
-                id_key = self._clean_property_key(match.group("key"))
-                node_id = self._value(match.group("expr"), param, parameters)
-                node_iri = self.terms.node_iri(label, node_id)
-                nodes[var] = {"iri": node_iri, "label": label, "id_key": id_key, "id": node_id}
-
-                updates.extend(self._node_insert_triples(node_iri, label, id_key, node_id))
-
-            for assignment in _SET_ASSIGNMENT.finditer(cypher):
-                var = assignment.group("var")
-                if var not in nodes:
-                    continue
-                value = self._value(assignment.group("expr"), param, parameters)
-                updates.append(self._property_triple(nodes[var]["iri"], assignment.group("key"), value))
-
-            for match in rel_specs:
-                src = nodes.get(match.group("src"))
-                dst = nodes.get(match.group("dst"))
-                if not src or not dst:
-                    raise UnsupportedRDFoxQueryError(f"Relationship endpoints were not MERGEd in query: {cypher}")
-
-                rel_type = match.group("type")
-                rel_props = match.group("props")
-                rel_value = self._relationship_value(rel_props, param, parameters)
-                updates.extend(self._relationship_insert_triples(src["iri"], rel_type, dst["iri"], rel_value, rel_props))
-
-            if updates:
-                self.client.update(f"INSERT DATA {{\n{chr(10).join(updates)}\n}}")
+            for context in self._unwind_contexts(cypher, param):
+                self._execute_unwind_merge_row(cypher, param, parameters, context, node_specs, rel_specs)
 
         return []
+
+    def _execute_unwind_merge_row(
+        self,
+        cypher: str,
+        param: dict[str, Any],
+        parameters: dict[str, Any],
+        context: dict[str, Any],
+        node_specs: list[re.Match],
+        rel_specs: list[re.Match],
+    ) -> None:
+        nodes: dict[str, dict[str, Any]] = {}
+        updates: list[str] = []
+
+        for match in node_specs:
+            var = match.group("var")
+            label = match.group("label")
+            id_key = self._clean_property_key(match.group("key"))
+            node_id = self._value(match.group("expr"), param, parameters, context)
+            node_iri = self.terms.node_iri(label, node_id)
+            nodes[var] = {"iri": node_iri, "label": label, "id_key": id_key, "id": node_id}
+
+            updates.extend(self._node_insert_triples(node_iri, label, id_key, node_id))
+
+        for assignment in _SET_ASSIGNMENT.finditer(cypher):
+            var = assignment.group("var")
+            if var not in nodes:
+                continue
+            value = self._value(assignment.group("expr"), param, parameters, context)
+            updates.append(self._property_triple(nodes[var]["iri"], assignment.group("key"), value))
+
+        for match in rel_specs:
+            src = nodes.get(match.group("src"))
+            dst = nodes.get(match.group("dst"))
+            if not src or not dst:
+                raise UnsupportedRDFoxQueryError(f"Relationship endpoints were not MERGEd in query: {cypher}")
+
+            rel_type = match.group("type")
+            rel_props = match.group("props")
+            rel_value = self._relationship_value(rel_props, param, parameters, context)
+            updates.extend(self._relationship_insert_triples(src["iri"], rel_type, dst["iri"], rel_value, rel_props))
+
+        if updates:
+            self.client.update(f"INSERT DATA {{\n{chr(10).join(updates)}\n}}")
+
+    def _unwind_contexts(self, cypher: str, param: dict[str, Any]) -> list[dict[str, Any]]:
+        nested_unwinds = list(_NESTED_UNWIND.finditer(cypher))
+        if not nested_unwinds:
+            return [{}]
+
+        contexts = [{}]
+        for nested_unwind in nested_unwinds:
+            values = param.get(nested_unwind.group("key"), [])
+            alias = nested_unwind.group("alias")
+            contexts = [
+                {**context, alias: value}
+                for context in contexts
+                for value in values
+            ]
+        return contexts
 
     def _execute_set_query(self, cypher: str, parameters: dict[str, Any]) -> list[dict[str, Any]]:
         label, id_key, node_id = self._single_node_filter(cypher, parameters)
@@ -229,12 +265,84 @@ class RDFoxGraphStore(GraphStore):
             )
         return []
 
+    def _execute_copy_complement_relationships(self, parameters: dict[str, Any]) -> list[dict[str, Any]]:
+        for param in parameters.get("params", []):
+            real_entity_id = param.get("n_id")
+            complement_entity_id = param.get("c_id")
+            if not real_entity_id or not complement_entity_id:
+                continue
+
+            real_entity = self.terms.node_iri("__Entity__", real_entity_id)
+            complement = self.terms.node_iri("__Entity__", complement_entity_id)
+            rows = self.client.query(
+                "SELECT ?source ?fact ?relationValue WHERE {\n"
+                + self._edge_match_pattern("?source", ["__RELATION__"], self.terms.iri(complement), "?relationEdge")
+                + "\n"
+                + self._edge_match_pattern(self.terms.iri(complement), ["__OBJECT__"], "?fact", "?objectEdge")
+                + "\n"
+                f"  OPTIONAL {{ ?relationEdge <{self.terms.predicate_iri('value')}> ?relationValue . }}\n"
+                "}"
+            )
+
+            triples = []
+            for row in rows:
+                triples.extend(
+                    self._relationship_insert_triples(
+                        row["source"],
+                        "__RELATION__",
+                        real_entity,
+                        row.get("relationValue"),
+                        "{value: r.value}",
+                    )
+                )
+                triples.extend(
+                    self._relationship_insert_triples(
+                        real_entity,
+                        "__OBJECT__",
+                        row["fact"],
+                        None,
+                        None,
+                    )
+                )
+            if triples:
+                self.client.update(f"INSERT DATA {{\n{chr(10).join(triples)}\n}}")
+        return []
+
+    def _execute_delete_complement_relationships(self, parameters: dict[str, Any]) -> list[dict[str, Any]]:
+        for param in parameters.get("params", []):
+            complement_entity_id = param.get("c_id")
+            if not complement_entity_id:
+                continue
+            complement = self.terms.node_iri("__Entity__", complement_entity_id)
+            self.client.update(
+                "DELETE {\n"
+                f"  {self.terms.iri(complement)} ?p ?o .\n"
+                f"  ?incoming ?incomingP {self.terms.iri(complement)} .\n"
+                "  ?edge ?edgeP ?edgeO .\n"
+                "}\nWHERE {\n"
+                f"  OPTIONAL {{ {self.terms.iri(complement)} ?p ?o . }}\n"
+                f"  OPTIONAL {{ ?incoming ?incomingP {self.terms.iri(complement)} . }}\n"
+                f"  OPTIONAL {{ ?edge <{self.terms.pg}from>|<{self.terms.pg}to> {self.terms.iri(complement)} . ?edge ?edgeP ?edgeO . }}\n"
+                "}"
+            )
+        return []
+
     def _execute_read_query(self, cypher: str, parameters: dict[str, Any]) -> list[dict[str, Any]]:
         upper = cypher.upper()
+        if "get complements matching subject" in cypher:
+            return self._execute_matching_subject_complements_read(parameters)
+        if "get subjects matching complement" in cypher:
+            return self._execute_matching_complement_subjects_read(parameters)
         if "delete source" in cypher and "RETURN DISTINCT" in cypher:
             return self._execute_delete_source_read(cypher, parameters)
+        if "RETURN DISTINCT" in cypher and "statementId" in cypher and " AS l" in cypher:
+            return self._execute_statement_id_projection_read(cypher, parameters)
         if "RETURN DISTINCT" in cypher and " AS " in cypher:
             return self._execute_projection_read(cypher, parameters)
+        if "get chunk content" in cypher and "RETURN c.value AS content" in cypher:
+            return self._execute_node_property_read("__Chunk__", "chunkId", parameters.get("nodeIds", []), "value", "content")
+        if "get topic content" in cypher and "RETURN s.value AS statement" in cypher:
+            return self._execute_topic_content_read(parameters)
         if "RETURN {" in upper and " AS RESULT" in upper:
             return self._execute_structured_result_read(cypher, parameters)
         if "count(r) AS score" in cypher:
@@ -297,6 +405,53 @@ class RDFoxGraphStore(GraphStore):
 
         raise UnsupportedRDFoxQueryError(f"Unsupported RDFox delete-source read query: {cypher}")
 
+    def _execute_matching_subject_complements_read(self, parameters: dict[str, Any]) -> list[dict[str, Any]]:
+        params = parameters.get("params", [])
+        if not params:
+            return []
+
+        values = " ".join(self.terms.literal(param.get("nId")) for param in params if param.get("nId"))
+        if not values:
+            return []
+
+        rows = self.client.query(
+            "SELECT ?n_id ?c_id WHERE {\n"
+            f"  VALUES ?n_id {{ {values} }}\n"
+            f"  ?n a <{self.terms.label_iri('__Entity__')}> ;\n"
+            f"    <{self.terms.predicate_iri('entityId')}> ?n_id ;\n"
+            f"    <{self.terms.predicate_iri('search_str')}> ?searchStr ;\n"
+            f"    <{self.terms.predicate_iri('class')}> ?nClass .\n"
+            f"  ?c a <{self.terms.label_iri('__Entity__')}> ;\n"
+            f"    <{self.terms.predicate_iri('entityId')}> ?c_id ;\n"
+            f"    <{self.terms.predicate_iri('search_str')}> ?searchStr ;\n"
+            f"    <{self.terms.predicate_iri('class')}> \"__Local_Entity__\" .\n"
+            f"  FILTER(?nClass != \"__Local_Entity__\")\n"
+            "}"
+        )
+        return rows
+
+    def _execute_matching_complement_subjects_read(self, parameters: dict[str, Any]) -> list[dict[str, Any]]:
+        params = parameters.get("params", [])
+        if not params:
+            return []
+
+        values = " ".join(
+            f"({self.terms.literal(param.get('nId'))} {self.terms.literal(param.get('cId'))})"
+            for param in params
+            if param.get("nId") and param.get("cId")
+        )
+        if not values:
+            return []
+
+        rows = self.client.query(
+            "SELECT ?n_id ?c_id WHERE {\n"
+            f"  VALUES (?n_id ?c_id) {{ {values} }}\n"
+            f"  ?n a <{self.terms.label_iri('__Entity__')}> ; <{self.terms.predicate_iri('entityId')}> ?n_id .\n"
+            f"  ?c a <{self.terms.label_iri('__Entity__')}> ; <{self.terms.predicate_iri('entityId')}> ?c_id .\n"
+            "}"
+        )
+        return rows
+
     def _execute_projection_read(self, cypher: str, parameters: dict[str, Any]) -> list[dict[str, Any]]:
         selector = self._first_return_selector(cypher)
         label, id_key, values = self._node_filter_values(cypher, parameters)
@@ -311,7 +466,147 @@ class RDFoxGraphStore(GraphStore):
                 rows.append({selector: value})
         return rows
 
+    def _execute_statement_id_projection_read(self, cypher: str, parameters: dict[str, Any]) -> list[dict[str, Any]]:
+        limit = int(parameters.get("statementLimit", 100))
+
+        if "chunk-based graph search" in cypher or "chunk-based semantic graph search" in cypher:
+            return self._statement_ids_for_chunk(parameters.get("chunkId"), limit)
+        if "chunk-based entity network search" in cypher:
+            return self._statement_ids_for_chunk(parameters.get("nodeId"), limit)
+        if "topic-based entity network search" in cypher:
+            return self._statement_ids_for_topic(parameters.get("nodeId"), limit)
+        if "topic-based graph search" in cypher:
+            return self._statement_ids_for_topic(parameters.get("topicId"), limit)
+        if "single entity-based graph search" in cypher:
+            return self._statement_ids_for_entity(parameters.get("startId"), limit)
+        if "multiple entity-based graph search" in cypher:
+            return self._statement_ids_for_entity_pair(parameters.get("startId"), parameters.get("endIds", []), limit)
+
+        raise UnsupportedRDFoxQueryError(f"Unsupported RDFox statement id projection query: {cypher}")
+
+    def _statement_ids_for_chunk(self, chunk_id: Optional[str], limit: int) -> list[dict[str, Any]]:
+        if not chunk_id:
+            return []
+
+        rows = self.client.query(
+            "SELECT DISTINCT ?statementId WHERE {\n"
+            f"  ?chunk a <{self.terms.label_iri('__Chunk__')}> ; <{self.terms.predicate_iri('chunkId')}> {self.terms.literal(chunk_id)} .\n"
+            f"  ?statement a <{self.terms.label_iri('__Statement__')}> ; <{self.terms.predicate_iri('statementId')}> ?statementId .\n"
+            + self._edge_match_pattern("?topic", ["__MENTIONED_IN__"], "?chunk", "?topicChunkEdge")
+            + "\n"
+            + self._edge_match_pattern("?statement", ["__BELONGS_TO__"], "?topic", "?statementTopicEdge")
+            + "\n"
+            f"}} LIMIT {limit}"
+        )
+        return [{"l": row["statementId"]} for row in rows]
+
+    def _statement_ids_for_topic(self, topic_id: Optional[str], limit: int) -> list[dict[str, Any]]:
+        if not topic_id:
+            return []
+
+        rows = self.client.query(
+            "SELECT DISTINCT ?statementId WHERE {\n"
+            f"  ?topic a <{self.terms.label_iri('__Topic__')}> ; <{self.terms.predicate_iri('topicId')}> {self.terms.literal(topic_id)} .\n"
+            f"  ?statement a <{self.terms.label_iri('__Statement__')}> ; <{self.terms.predicate_iri('statementId')}> ?statementId .\n"
+            + self._edge_match_pattern("?statement", ["__BELONGS_TO__"], "?topic", "?statementTopicEdge")
+            + "\n"
+            f"}} LIMIT {limit}"
+        )
+        return [{"l": row["statementId"]} for row in rows]
+
+    def _statement_ids_for_entity(self, entity_id: Optional[str], limit: int) -> list[dict[str, Any]]:
+        if not entity_id:
+            return []
+
+        rows = self.client.query(
+            "SELECT DISTINCT ?statementId WHERE {\n"
+            f"  ?entity a <{self.terms.label_iri('__Entity__')}> ; <{self.terms.predicate_iri('entityId')}> {self.terms.literal(entity_id)} .\n"
+            f"  ?statement a <{self.terms.label_iri('__Statement__')}> ; <{self.terms.predicate_iri('statementId')}> ?statementId .\n"
+            + self._edge_match_pattern("?entity", ["__SUBJECT__"], "?fact", "?subjectEdge")
+            + "\n"
+            + self._edge_match_pattern("?fact", ["__SUPPORTS__"], "?statement", "?supportEdge")
+            + "\n"
+            f"}} LIMIT {limit}"
+        )
+        return [{"l": row["statementId"]} for row in rows]
+
+    def _statement_ids_for_entity_pair(self, start_id: Optional[str], end_ids: list[str], limit: int) -> list[dict[str, Any]]:
+        if not start_id or not end_ids:
+            return []
+
+        values = " ".join(self.terms.literal(entity_id) for entity_id in end_ids)
+        rows = self.client.query(
+            "SELECT DISTINCT ?statementId WHERE {\n"
+            f"  VALUES ?endEntityId {{ {values} }}\n"
+            f"  ?start a <{self.terms.label_iri('__Entity__')}> ; <{self.terms.predicate_iri('entityId')}> {self.terms.literal(start_id)} .\n"
+            f"  ?end a <{self.terms.label_iri('__Entity__')}> ; <{self.terms.predicate_iri('entityId')}> ?endEntityId .\n"
+            f"  ?statement a <{self.terms.label_iri('__Statement__')}> ; <{self.terms.predicate_iri('statementId')}> ?statementId .\n"
+            + self._edge_match_pattern("?start", ["__SUBJECT__", "__OBJECT__"], "?fact", "?startFactEdge")
+            + "\n"
+            + self._edge_match_pattern("?end", ["__SUBJECT__", "__OBJECT__"], "?fact", "?endFactEdge")
+            + "\n"
+            + self._edge_match_pattern("?fact", ["__SUPPORTS__"], "?statement", "?supportEdge")
+            + "\n"
+            f"}} LIMIT {limit}"
+        )
+        return [{"l": row["statementId"]} for row in rows]
+
+    def _execute_node_property_read(
+        self,
+        label: str,
+        id_key: str,
+        node_ids: list[str],
+        property_key: str,
+        result_key: str,
+    ) -> list[dict[str, Any]]:
+        if not node_ids:
+            return []
+
+        values = " ".join(self.terms.literal(node_id) for node_id in node_ids)
+        rows = self.client.query(
+            f"SELECT ?{result_key} WHERE {{\n"
+            f"  VALUES ?id {{ {values} }}\n"
+            f"  ?node a <{self.terms.label_iri(label)}> ;\n"
+            f"        <{self.terms.predicate_iri(id_key)}> ?id ;\n"
+            f"        <{self.terms.predicate_iri(property_key)}> ?{result_key} .\n"
+            "}"
+        )
+        return [{result_key: row[result_key]} for row in rows]
+
+    def _execute_topic_content_read(self, parameters: dict[str, Any]) -> list[dict[str, Any]]:
+        topic_id = parameters.get("topicId")
+        if not topic_id:
+            return []
+
+        limit = int(parameters.get("statementLimit", 10))
+        return self.client.query(
+            "SELECT ?statement (COALESCE(?rawDetails, \"\") AS ?details) WHERE {\n"
+            f"  ?topic a <{self.terms.label_iri('__Topic__')}> ; <{self.terms.predicate_iri('topicId')}> {self.terms.literal(topic_id)} .\n"
+            f"  ?statementNode a <{self.terms.label_iri('__Statement__')}> ; <{self.terms.predicate_iri('value')}> ?statement .\n"
+            f"  OPTIONAL {{ ?statementNode <{self.terms.predicate_iri('details')}> ?rawDetails . }}\n"
+            + self._edge_match_pattern("?statementNode", ["__BELONGS_TO__"], "?topic", "?belongsTo")
+            + "\n"
+            + self._edge_match_pattern("?factNode", ["__SUPPORTS__"], "?statementNode", "?supports")
+            + "\n"
+            "} GROUP BY ?statement ?rawDetails ORDER BY DESC(COUNT(?factNode)) "
+            f"LIMIT {limit}"
+        )
+
     def _execute_structured_result_read(self, cypher: str, parameters: dict[str, Any]) -> list[dict[str, Any]]:
+        if "get entities for keywords" in cypher:
+            return self._execute_entities_for_keyword_read(cypher, parameters)
+        if "get entities for chunk ids" in cypher:
+            return self._execute_entities_for_index_nodes_read("__Chunk__", "chunkId", parameters)
+        if "get entities for topic ids" in cypher:
+            return self._execute_entities_for_index_nodes_read("__Topic__", "topicId", parameters)
+        if "Get statements for top chunk" in cypher:
+            return self._execute_top_statement_read(cypher, parameters)
+        if "Get entities for statement" in cypher:
+            return self._execute_entities_for_statement_read(parameters)
+        if "get next level in tree" in cypher:
+            return self._execute_next_entity_level_read(parameters)
+        if "expand entities: score entities by number of relations" in cypher:
+            return self._execute_entities_by_id_read(parameters)
         if "source_id:" in cypher and "valid_from:" in cypher:
             return self._execute_source_version_read(parameters)
         if "sourceId:" in cypher and "nodeIds:" in cypher:
@@ -319,6 +614,189 @@ class RDFoxGraphStore(GraphStore):
         if "source:" in cypher and "topics:" in cypher:
             return self._execute_statement_grouping_read(parameters)
         raise UnsupportedRDFoxQueryError(f"Unsupported RDFox structured read query: {cypher}")
+
+    def _execute_entities_for_keyword_read(self, cypher: str, parameters: dict[str, Any]) -> list[dict[str, Any]]:
+        keyword = parameters.get("keyword")
+        if not keyword:
+            return []
+
+        filters = [
+            f"?entity a <{self.terms.label_iri('__Entity__')}> .",
+            f"?entity <{self.terms.predicate_iri('entityId')}> ?entityId .",
+            f"?entity <{self.terms.predicate_iri('value')}> ?value .",
+            f"?entity <{self.terms.predicate_iri('class')}> ?class .",
+        ]
+        if "STARTS WITH $keyword" in cypher:
+            filters.append(f"?entity <{self.terms.predicate_iri('search_str')}> ?searchStr .")
+            filters.append(f"FILTER(STRSTARTS(STR(?searchStr), STR({self.terms.literal(keyword)})))")
+        else:
+            filters.append(f"?entity <{self.terms.predicate_iri('search_str')}> {self.terms.literal(keyword)} .")
+
+        classification = parameters.get("classification")
+        if classification:
+            if "class STARTS WITH $classification" in cypher:
+                filters.append(f"FILTER(STRSTARTS(STR(?class), STR({self.terms.literal(classification)})))")
+            else:
+                filters.append(f"FILTER(?class = {self.terms.literal(classification)})")
+        else:
+            filters.append('FILTER(?class != "__Local_Entity__")')
+
+        return self._execute_scored_entity_read("\n  ".join(filters), int(parameters.get("limit", 100)))
+
+    def _execute_entities_for_index_nodes_read(
+        self,
+        index_label: str,
+        index_id_key: str,
+        parameters: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        node_ids = parameters.get("nodeIds", [])
+        if not node_ids:
+            return []
+
+        values = " ".join(self.terms.literal(node_id) for node_id in node_ids)
+        statement_relation = "__BELONGS_TO__" if index_label == "__Topic__" else "__MENTIONED_IN__"
+        filters = [
+            f"VALUES ?nodeId {{ {values} }}",
+            f"?indexNode a <{self.terms.label_iri(index_label)}> ; <{self.terms.predicate_iri(index_id_key)}> ?nodeId .",
+            f"?entity a <{self.terms.label_iri('__Entity__')}> .",
+            f"?entity <{self.terms.predicate_iri('entityId')}> ?entityId .",
+            f"?entity <{self.terms.predicate_iri('value')}> ?value .",
+            f"?entity <{self.terms.predicate_iri('class')}> ?class .",
+            'FILTER(?class != "__Local_Entity__")',
+            self._edge_match_pattern("?statement", [statement_relation], "?indexNode", "?indexEdge"),
+            self._edge_match_pattern("?fact", ["__SUPPORTS__"], "?statement", "?supportEdge"),
+            self._edge_match_pattern("?entity", ["__SUBJECT__", "__OBJECT__"], "?fact", "?roleEdge"),
+        ]
+        return self._execute_scored_entity_read("\n  ".join(filters), int(parameters.get("limit", 100)))
+
+    def _execute_top_statement_read(self, cypher: str, parameters: dict[str, Any]) -> list[dict[str, Any]]:
+        node_ids = parameters.get("nodeIds", [])
+        if not node_ids:
+            return []
+
+        if "t.topicId" in cypher:
+            index_label = "__Topic__"
+            index_id_key = "topicId"
+            statement_relation = "__BELONGS_TO__"
+        else:
+            index_label = "__Chunk__"
+            index_id_key = "chunkId"
+            statement_relation = "__MENTIONED_IN__"
+
+        values = " ".join(self.terms.literal(node_id) for node_id in node_ids)
+        rows = self.client.query(
+            "SELECT DISTINCT ?statement ?statementId WHERE {\n"
+            f"  VALUES ?nodeId {{ {values} }}\n"
+            f"  ?indexNode a <{self.terms.label_iri(index_label)}> ; <{self.terms.predicate_iri(index_id_key)}> ?nodeId .\n"
+            f"  ?statementNode a <{self.terms.label_iri('__Statement__')}> ;\n"
+            f"    <{self.terms.predicate_iri('statementId')}> ?statementId ;\n"
+            f"    <{self.terms.predicate_iri('value')}> ?statement .\n"
+            + self._edge_match_pattern("?statementNode", [statement_relation], "?indexNode", "?statementEdge")
+            + "\n}"
+        )
+        return [
+            {"result": {"statement": row["statement"], "statementId": row["statementId"]}}
+            for row in rows
+        ]
+
+    def _execute_entities_for_statement_read(self, parameters: dict[str, Any]) -> list[dict[str, Any]]:
+        statement_ids = parameters.get("statementIds", [])
+        if not statement_ids:
+            return []
+
+        values = " ".join(self.terms.literal(statement_id) for statement_id in statement_ids)
+        filters = [
+            f"VALUES ?statementId {{ {values} }}",
+            f"?statement a <{self.terms.label_iri('__Statement__')}> ; <{self.terms.predicate_iri('statementId')}> ?statementId .",
+            f"?entity a <{self.terms.label_iri('__Entity__')}> .",
+            f"?entity <{self.terms.predicate_iri('entityId')}> ?entityId .",
+            f"?entity <{self.terms.predicate_iri('value')}> ?value .",
+            f"?entity <{self.terms.predicate_iri('class')}> ?class .",
+            'FILTER(?class != "__Local_Entity__")',
+            self._edge_match_pattern("?fact", ["__SUPPORTS__"], "?statement", "?supportEdge"),
+            self._edge_match_pattern("?entity", ["__SUBJECT__", "__OBJECT__"], "?fact", "?roleEdge"),
+        ]
+        return self._execute_scored_entity_read("\n  ".join(filters), int(parameters.get("limit", 100)))
+
+    def _execute_entities_by_id_read(self, parameters: dict[str, Any]) -> list[dict[str, Any]]:
+        entity_ids = parameters.get("entityIds", [])
+        if not entity_ids:
+            return []
+
+        values = " ".join(self.terms.literal(entity_id) for entity_id in entity_ids)
+        filters = [
+            f"VALUES ?entityId {{ {values} }}",
+            f"?entity a <{self.terms.label_iri('__Entity__')}> .",
+            f"?entity <{self.terms.predicate_iri('entityId')}> ?entityId .",
+            f"?entity <{self.terms.predicate_iri('value')}> ?value .",
+            f"?entity <{self.terms.predicate_iri('class')}> ?class .",
+        ]
+        return self._execute_scored_entity_read("\n  ".join(filters), int(parameters.get("limit", 100)))
+
+    def _execute_next_entity_level_read(self, parameters: dict[str, Any]) -> list[dict[str, Any]]:
+        entity_ids = parameters.get("entityIds", [])
+        if not entity_ids:
+            return []
+
+        excluded_entity_ids = parameters.get("excludeEntityIds", [])
+        values = " ".join(self.terms.literal(entity_id) for entity_id in entity_ids)
+        excluded_filter = ""
+        if excluded_entity_ids:
+            excluded = ", ".join(self.terms.literal(entity_id) for entity_id in excluded_entity_ids)
+            excluded_filter = f"FILTER(?otherEntityId NOT IN ({excluded}))"
+
+        rows = self.client.query(
+            "SELECT ?entityId ?value ?class ?otherEntityId (COUNT(?scoreEdge) AS ?score) WHERE {\n"
+            f"  VALUES ?entityId {{ {values} }}\n"
+            f"  ?entity a <{self.terms.label_iri('__Entity__')}> ;\n"
+            f"    <{self.terms.predicate_iri('entityId')}> ?entityId ;\n"
+            f"    <{self.terms.predicate_iri('value')}> ?value ;\n"
+            f"    <{self.terms.predicate_iri('class')}> ?class .\n"
+            f"  ?other a <{self.terms.label_iri('__Entity__')}> ;\n"
+            f"    <{self.terms.predicate_iri('entityId')}> ?otherEntityId ;\n"
+            f"    <{self.terms.predicate_iri('class')}> ?otherClass .\n"
+            f"  FILTER(?otherClass != \"__Local_Entity__\")\n"
+            f"  {excluded_filter}\n"
+            + self._edge_match_pattern("?entity", ["__RELATION__"], "?other", "?relationEdge")
+            + "\n"
+            + self._edge_match_pattern("?other", ["__SUBJECT__", "__OBJECT__"], "?target", "?scoreEdge")
+            + "\n"
+            "} GROUP BY ?entityId ?value ?class ?otherEntityId ORDER BY DESC(?score)"
+        )
+
+        neighbours_by_entity: dict[str, dict[str, Any]] = {}
+        limit = int(parameters.get("numNeighbours", 5))
+        for row in rows:
+            result = neighbours_by_entity.setdefault(
+                row["entityId"],
+                {
+                    "entity": {"entityId": row["entityId"], "value": row["value"], "class": row["class"]},
+                    "others": [],
+                },
+            )
+            if len(result["others"]) < limit:
+                result["others"].append(row["otherEntityId"])
+
+        return [{"result": result} for result in neighbours_by_entity.values()]
+
+    def _execute_scored_entity_read(self, filters: str, limit: int) -> list[dict[str, Any]]:
+        rows = self.client.query(
+            "SELECT ?entityId ?value ?class (COUNT(?scoreEdge) AS ?score) WHERE {\n"
+            f"  {filters}\n"
+            + self._edge_match_pattern("?entity", ["__SUBJECT__", "__OBJECT__"], "?scoreTarget", "?scoreEdge")
+            + "\n"
+            "} GROUP BY ?entityId ?value ?class ORDER BY DESC(?score) "
+            f"LIMIT {limit}"
+        )
+        return [
+            {
+                "result": {
+                    "entity": {"entityId": row["entityId"], "value": row["value"], "class": row["class"]},
+                    "score": row["score"],
+                }
+            }
+            for row in rows
+        ]
 
     def _execute_entity_score_read(self, cypher: str, parameters: dict[str, Any]) -> list[dict[str, Any]]:
         keyword = parameters.get("keyword")
@@ -560,19 +1038,35 @@ class RDFoxGraphStore(GraphStore):
     def _property_triple(self, subject_iri: str, key: str, value: Any) -> str:
         return f"{self.terms.iri(subject_iri)} {self.terms.iri(self.terms.predicate_iri(key))} {self.terms.literal(value)} ."
 
-    def _relationship_value(self, props: Optional[str], param: dict[str, Any], parameters: dict[str, Any]) -> Any:
+    def _relationship_value(
+        self,
+        props: Optional[str],
+        param: dict[str, Any],
+        parameters: dict[str, Any],
+        context: Optional[dict[str, Any]] = None,
+    ) -> Any:
         if not props:
             return None
         match = re.search(r"value\s*:\s*([^}]+)", props)
         if not match:
             return None
-        return self._value(match.group(1), param, parameters)
+        return self._value(match.group(1), param, parameters, context)
 
-    def _value(self, expr: str, param: dict[str, Any], parameters: dict[str, Any]) -> Any:
+    def _value(
+        self,
+        expr: str,
+        param: dict[str, Any],
+        parameters: dict[str, Any],
+        context: Optional[dict[str, Any]] = None,
+    ) -> Any:
         expr = expr.strip()
         expr = re.split(r"\s+ON\s+(?:CREATE|MATCH)\s+SET\s+", expr, maxsplit=1, flags=re.IGNORECASE)[0].strip()
         if expr.startswith("params."):
-            return param.get(expr[len("params."):])
+            return self._nested_value(param, expr[len("params."):])
+        context = context or {}
+        context_match = re.match(r"(?P<alias>[A-Za-z_][A-Za-z0-9_]*)\.(?P<path>.+)", expr)
+        if context_match and context_match.group("alias") in context:
+            return self._nested_value(context[context_match.group("alias")], context_match.group("path"))
         if expr.startswith("$"):
             return parameters.get(expr[1:])
         if expr.startswith("'") and expr.endswith("'"):
@@ -582,6 +1076,14 @@ class RDFoxGraphStore(GraphStore):
         if expr.isdigit():
             return int(expr)
         return expr
+
+    def _nested_value(self, data: Any, path: str) -> Any:
+        value = data
+        for part in path.split("."):
+            if not isinstance(value, dict):
+                return None
+            value = value.get(part)
+        return value
 
     def _single_node_filter(self, cypher: str, parameters: dict[str, Any]) -> tuple[str, str, Any]:
         label, id_key, values = self._node_filter_values(cypher, parameters)
