@@ -228,11 +228,12 @@ class RDFoxGraphStore(GraphStore):
         return []
 
     def _execute_read_query(self, cypher: str, parameters: dict[str, Any]) -> list[dict[str, Any]]:
+        upper = cypher.upper()
         if "delete source" in cypher and "RETURN DISTINCT" in cypher:
             return self._execute_delete_source_read(cypher, parameters)
         if "RETURN DISTINCT" in cypher and " AS " in cypher:
             return self._execute_projection_read(cypher, parameters)
-        if "RETURN {" in cypher and " AS result" in cypher:
+        if "RETURN {" in upper and " AS RESULT" in upper:
             return self._execute_structured_result_read(cypher, parameters)
         if "count(r) AS score" in cypher:
             return self._execute_entity_score_read(cypher, parameters)
